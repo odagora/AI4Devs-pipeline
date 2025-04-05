@@ -1,0 +1,132 @@
+name: Backend CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - '**'  # Matches any branch
+    paths:
+      - 'backend/**'  # Only trigger on changes to backend files
+
+jobs:
+  check_pr:
+    runs-on: ubuntu-latest
+    outputs:
+      has_pr: ${{ steps.verify_pr.outputs.has_pr }}
+    steps:
+      - name: Check if branch has an open PR
+        id: verify_pr
+        run: |
+          PR_COUNT=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${{ github.ref_name }}&state=open" | jq length)
+          echo "has_pr=$([[ $PR_COUNT -gt 0 ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+  test:
+    needs: check_pr
+    if: needs.check_pr.outputs.has_pr == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: './backend/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint || true
+
+      - name: Run unit tests
+        run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: './backend/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deployment
+          cp -r dist package.json package-lock.json prisma .env deployment/
+          cd deployment && zip -r ../backend-deployment.zip .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-deployment
+          path: ./backend/backend-deployment.zip
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: backend-deployment
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to EC2
+        run: |
+          # Copy deployment package to S3
+          aws s3 cp backend-deployment.zip s3://${{ secrets.DEPLOYMENT_BUCKET }}/backend-deployment.zip
+
+          # Connect to EC2 instance and deploy
+          aws ssm send-command \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands=[\
+              "cd /var/www/backend",\
+              "aws s3 cp s3://${{ secrets.DEPLOYMENT_BUCKET }}/backend-deployment.zip .",\
+              "unzip -o backend-deployment.zip -d .",\
+              "npm ci --production",\
+              "npx prisma migrate deploy",\
+              "pm2 restart backend-app"\
+            ]
+
+      - name: Verify deployment
+        run: |
+          # Wait for the application to start
+          sleep 30
+
+          # Check if application is running
+          HEALTH_CHECK=$(curl -s -o /dev/null -w "%{http_code}" http://${{ secrets.EC2_INSTANCE_DNS }}/api/health || echo "Failed")
+
+          if [ "$HEALTH_CHECK" == "200" ]; then
+            echo "Deployment successful!"
+          else
+            echo "Deployment verification failed with status: $HEALTH_CHECK"
+            exit 1
